@@ -1,0 +1,8 @@
+# Discord Bot Configuration
+DISCORD_TOKEN=tu_token_de_discord_aqui
+CLIENT_ID=tu_client_id_aqui
+GUILD_ID=tu_guild_id_aqui_opcional
+
+# Spotify API Configuration
+SPOTIFY_CLIENT_ID=tu_spotify_client_id_aqui
+SPOTIFY_CLIENT_SECRET=tu_spotify_client_secret_aqui

@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  discord-music-bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - CLIENT_ID=${CLIENT_ID}
+      - GUILD_ID=${GUILD_ID}
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET}
+      - NODE_ENV=production
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - bot-network
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "node", "health-check.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - bot-network
+
+  # Opcional: Base de datos para persistencia
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: musicbot
+      POSTGRES_USER: ${DB_USER:-musicbot}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-musicbot123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bot-network
+
+volumes:
+  redis_data:
+  postgres_data:
+
+networks:
+  bot-network:
+    driver: bridge
