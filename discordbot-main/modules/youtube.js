@@ -2,23 +2,63 @@ const ytSearch = require('yt-search');
 const ytpl = require('ytpl');
 const { spawn } = require('child_process');
 
-// Función para buscar en YouTube
+// Cache para búsquedas
+const searchCache = new Map();
+const SEARCH_TIMEOUT = 15000; // 15 segundos máximo para búsquedas
+const CACHE_TTL = 3600000; // 1 hora
+
+function setSearchCache(key, value) {
+    searchCache.set(key, { value, timestamp: Date.now() });
+}
+
+function getSearchCache(key) {
+    const cached = searchCache.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.value;
+    }
+    if (cached) {
+        searchCache.delete(key);
+    }
+    return null;
+}
+
+// Función para buscar en YouTube CON CACHÉ Y TIMEOUT
 async function searchYouTube(query) {
     try {
-        console.log('Buscando en YouTube:', query);
-        const searchResults = await ytSearch(query);
-        console.log('Resultados de búsqueda de YouTube:', searchResults && searchResults.videos ? searchResults.videos[0] : null);
-        return searchResults.videos.length > 0 ? searchResults.videos[0] : null;
+        // Verificar caché primero
+        const cached = getSearchCache(query);
+        if (cached) {
+            return cached;
+        }
+
+        // Búsqueda con timeout
+        const searchPromise = ytSearch(query);
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Búsqueda en YouTube excedió el tiempo límite')), SEARCH_TIMEOUT)
+        );
+
+        const searchResults = await Promise.race([searchPromise, timeoutPromise]);
+        
+        // Cachear resultado
+        const result = searchResults.videos && searchResults.videos.length > 0 ? searchResults.videos[0] : null;
+        if (result) {
+            setSearchCache(query, result);
+        }
+        return result;
     } catch (error) {
-        console.error('Error al buscar en YouTube:', error);
+        console.error('Error al buscar en YouTube:', error.message);
         return null;
     }
 }
 
-// Función para obtener un stream de audio usando yt-dlp
+// Función para obtener un stream de audio usando yt-dlp CON TIMEOUT
 async function getYtDlpStream(youtubeUrl) {
     return new Promise((resolve, reject) => {
-        // Usar python -m yt_dlp para máxima compatibilidad
+        const timeout = setTimeout(() => {
+            ytdlp.kill();
+            reject(new Error('yt-dlp excedió el tiempo límite (120 segundos)'));
+        }, 120000); // 2 minutos máximo
+
         const ytdlp = spawn('python', [
             '-m', 'yt_dlp',
             '-f', 'bestaudio[ext=m4a]/bestaudio/best',
@@ -26,13 +66,15 @@ async function getYtDlpStream(youtubeUrl) {
             '--quiet',
             '--no-warnings',
             youtubeUrl
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
 
         ytdlp.on('error', (err) => {
+            clearTimeout(timeout);
             reject(new Error('No se pudo iniciar yt-dlp. ¿Está Python y yt-dlp instalados?'));
         });
 
         ytdlp.on('close', (code) => {
+            clearTimeout(timeout);
             if (code !== 0) {
                 reject(new Error(`yt-dlp terminó con código ${code}`));
             }
@@ -54,14 +96,11 @@ async function processYouTubeVideo(cleanQuery, interaction) {
             // Construir URL limpia y buscar
             const cleanVideoUrl = `https://www.youtube.com/watch?v=${videoId}`;
             videoInfo = await searchYouTube(cleanVideoUrl);
-            console.log('Búsqueda por URL limpia:', cleanVideoUrl, videoInfo);
         } else {
             // Fallback: búsqueda normal
             videoInfo = await searchYouTube(cleanQuery);
-            console.log('Búsqueda normal:', cleanQuery, videoInfo);
         }
         
-        console.log('Info video YouTube:', videoInfo);
         if (videoInfo && videoInfo.videoId) {
             // Normalizar la URL de YouTube
             let normalizedUrl = `https://www.youtube.com/watch?v=${videoInfo.videoId}`;
@@ -78,7 +117,7 @@ async function processYouTubeVideo(cleanQuery, interaction) {
         }
         return null;
     } catch (error) {
-        console.error('Error al obtener información de YouTube:', error);
+        console.error('❌ Error al obtener información de YouTube:', error.message);
         return null;
     }
 }

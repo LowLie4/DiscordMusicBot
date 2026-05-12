@@ -24,6 +24,33 @@ const config = {
     }
 };
 
+// Sistema de caché para optimizar búsquedas
+const searchCache = new Map();
+const CACHE_TTL = 3600000; // 1 hora en milisegundos
+const MAX_CACHE_ENTRIES = 500;
+
+function setCache(key, value) {
+    if (searchCache.size >= MAX_CACHE_ENTRIES) {
+        const firstKey = searchCache.keys().next().value;
+        searchCache.delete(firstKey);
+    }
+    searchCache.set(key, { value, timestamp: Date.now() });
+}
+
+function getCache(key) {
+    const cached = searchCache.get(key);
+    if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+        return cached.value;
+    }
+    if (cached) {
+        searchCache.delete(key);
+    }
+    return null;
+}
+
+// Modo debug (puedes cambiar a true para más logs)
+const DEBUG_MODE = process.env.DEBUG === 'true';
+
 // Inicializar cliente de Discord
 const client = new Client({
     intents: [
@@ -40,6 +67,22 @@ initializeSpotify(config.spotify.clientId, config.spotify.clientSecret);
 // Mapa para almacenar las conexiones de voz y colas de reproducción
 const connections = new Map();
 const queues = new Map();
+
+// Limpieza automática de colas inactivas cada 5 minutos
+setInterval(() => {
+    const now = Date.now();
+    for (const [guildId, queue] of queues.entries()) {
+        // Si la cola está vacía y no se está reproduciendo, eliminarla después de 30 minutos
+        if (queue.isEmpty() && !queue.isPlaying && now - (queue.lastActivityTime || 0) > 1800000) {
+            const connection = connections.get(guildId);
+            if (connection) {
+                connection.destroy();
+            }
+            connections.delete(guildId);
+            queues.delete(guildId);
+        }
+    }
+}, 300000); // Verificar cada 5 minutos
 
 // Pre-cargar la siguiente canción pendiente en la cola (ahora con promesa de carga)
 async function prepareNextSong(queue) {
@@ -76,25 +119,115 @@ async function prepareNextSong(queue) {
     }
 }
 
-// Modificar getYtDlpStream para usar ./yt-dlp si existe
+// Parsear duración en formato MM:SS o segundos a milisegundos
+function parseDuration(duration) {
+    if (typeof duration === 'number') {
+        return duration * 1000;
+    }
+    if (typeof duration === 'string') {
+        const parts = duration.split(':');
+        if (parts.length === 2) {
+            const minutes = parseInt(parts[0]);
+            const seconds = parseInt(parts[1]);
+            return (minutes * 60 + seconds) * 1000;
+        }
+    }
+    return 0;
+}
 
-// Función para reproducir música usando yt-dlp
+// Función para iniciar crossfade
+async function initiateCrossfade(queue, guildId, channel, durationMs) {
+    if (queue.isCrossfading || !queue.player || durationMs < 7000) return;
+    
+    const crossfadeStartTime = durationMs - 7000; // Comienza 7 segundos antes
+    
+    queue.crossfadeTimeout = setTimeout(async () => {
+        if (queue.isEmpty()) return;
+        
+        try {
+            queue.isCrossfading = true;
+            const nextSong = await queue.getNextPlayableSong();
+            
+            if (!nextSong || !nextSong.url) return;
+            
+            // Preparar siguiente reproductor
+            if (!queue.nextPlayer) {
+                queue.nextPlayer = createAudioPlayer();
+                queue.connection.subscribe(queue.nextPlayer);
+            }
+            
+            // Obtener stream de la siguiente canción
+            const nextStream = await getYtDlpStream(nextSong.url);
+            queue.nextResource = createAudioResource(nextStream, { inlineVolume: true });
+            queue.nextResource.volume.setVolume(0.0);
+            
+            // Reproducir siguiente con volumen en 0
+            queue.nextPlayer.play(queue.nextResource);
+            
+            // Transición suave de volumen (7 segundos)
+            const totalSteps = 70;
+            let step = 0;
+            
+            queue.crossfadeInterval = setInterval(() => {
+                if (step >= totalSteps) {
+                    clearInterval(queue.crossfadeInterval);
+                    // Detener reproductor anterior y cambiar al siguiente
+                    if (queue.player) {
+                        queue.player.stop();
+                    }
+                    queue.player = queue.nextPlayer;
+                    queue.nextPlayer = null;
+                    queue.currentSong = nextSong;
+                    queue.isCrossfading = false;
+                    
+                    updateMusicPanel(nextSong, queue, client).catch(() => {});
+                    return;
+                }
+                
+                const progress = step / totalSteps;
+                const volumeOut = Math.max(0.1 * (1 - progress), 0);
+                const volumeIn = Math.min(0.1 * progress, 0.1);
+                
+                if (queue.player && queue.player.state) {
+                    if (queue.player.state.resource && queue.player.state.resource.volume) {
+                        queue.player.state.resource.volume.setVolume(volumeOut);
+                    }
+                }
+                
+                if (queue.nextResource && queue.nextResource.volume) {
+                    queue.nextResource.volume.setVolume(volumeIn);
+                }
+                
+                step++;
+            }, 100); // Actualizar cada 100ms
+            
+        } catch (error) {
+            console.error('[CROSSFADE] Error:', error);
+            queue.isCrossfading = false;
+            clearInterval(queue.crossfadeInterval);
+        }
+    }, crossfadeStartTime);
+}
+
+// Función para reproducir música usando yt-dlp CON CROSSFADE
 async function playMusic(guildId, channel) {
     const queue = queues.get(guildId);
     if (!queue || queue.isEmpty()) {
-        console.log('[DEBUG] Cola vacía o no existe para guild', guildId);
+        if (DEBUG_MODE) console.log('[DEBUG] Cola vacía o no existe para guild', guildId);
         await updateMusicPanel(null, queue, client);
         return;
     }
     if (queue.isProcessing) {
-        console.log('[DEBUG] Ya se está procesando música para guild', guildId);
+        if (DEBUG_MODE) console.log('[DEBUG] Ya se está procesando música para guild', guildId);
         return;
     }
     queue.isProcessing = true;
+    queue.lastActivityTime = Date.now(); // Actualizar tiempo de actividad
+    
     try {
         const song = await queue.getNextPlayableSong();
         if (!song || !song.url) {
-            console.log('[DEBUG] No se encontró canción reproducible en la cola', queue.songs);
+            if (DEBUG_MODE) console.log('[DEBUG] No se encontró canción reproducible en la cola');
             await channel.send('❌ No se encontró ninguna canción reproducible en la cola. Se detiene la reproducción.');
             queue.isPlaying = false;
             queue.currentSong = null;
@@ -102,40 +235,59 @@ async function playMusic(guildId, channel) {
             return;
         }
         queue.currentSong = song;
+        queue.clearCrossfade();
         prepareNextSong(queue);
         try {
-            console.log('[DEBUG] Intentando obtener stream con yt-dlp para', song.url);
+            if (DEBUG_MODE) console.log('[DEBUG] Reproduciendo:', song.title);
             const audioStream = await getYtDlpStream(song.url);
-            console.log('[DEBUG] Stream obtenido, creando recurso de audio con ffmpeg');
             const resource = createAudioResource(audioStream, { inlineVolume: true });
             resource.volume.setVolume(0.1);
+            
             if (!queue.player) {
                 queue.player = createAudioPlayer();
                 queue.connection.subscribe(queue.player);
             } else {
                 queue.player.removeAllListeners();
             }
+            
             queue.player.play(resource);
             queue.isPlaying = true;
+            
+            // Parsear duración de la canción
+            const durationMs = parseDuration(song.duration);
+            queue.currentDuration = durationMs;
+            queue.currentStartTime = Date.now();
+            
+            // Iniciar crossfade si hay duración válida
+            if (durationMs > 7000) {
+                initiateCrossfade(queue, guildId, channel, durationMs);
+            }
+            
+            // Evento cuando termina la canción (solo si no está en crossfade)
             queue.player.on(AudioPlayerStatus.Idle, async () => {
-                queue.isPlaying = false;
-                if (!queue.isEmpty()) {
-                    playMusic(guildId, channel);
-                } else {
-                    await updateMusicPanel(null, queue, client);
+                if (!queue.isCrossfading) {
+                    queue.isPlaying = false;
+                    if (!queue.isEmpty()) {
+                        playMusic(guildId, channel);
+                    } else {
+                        await updateMusicPanel(null, queue, client);
+                    }
                 }
             });
+            
             queue.player.on('error', error => {
-                console.error('[DEBUG] Error en el reproductor:', error);
+                console.error('[ERROR] Error en el reproductor:', error.message);
+                queue.isCrossfading = false;
                 queue.isPlaying = false;
                 if (!queue.isEmpty()) {
                     playMusic(guildId, channel);
                 }
             });
+            
             await updateMusicPanel(song, queue, client);
         } catch (error) {
-            console.error('[DEBUG] Error al reproducir música:', error);
-            channel.send('❌ Error al reproducir la canción. Asegúrate de tener yt-dlp y FFmpeg instalados.');
+            console.error('[ERROR] Error al reproducir música:', error.message);
+            await channel.send('❌ Error al reproducir la canción. Asegúrate de tener yt-dlp y FFmpeg instalados.');
             if (!queue.isEmpty()) {
                 playMusic(guildId, channel);
             }
@@ -227,6 +379,10 @@ const commands = [
                 .setMinValue(1)
                 .setRequired(true)
         ),
+    
+    new SlashCommandBuilder()
+        .setName('shuffle')
+        .setDescription('Mezcla aleatoriamente el orden de las canciones en la cola'),
 ];
 
 // Evento cuando el bot está listo
@@ -315,6 +471,9 @@ client.on('interactionCreate', async interaction => {
             case 'remove':
                 await handleRemove(interaction);
                 break;
+            case 'shuffle':
+                await handleShuffle(interaction);
+                break;
             case 'help':
                 await handleHelp(interaction);
                 break;
@@ -391,9 +550,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 // Función para manejar el comando play
 async function handlePlay(interaction) {
     const query = interaction.options.getString('query');
-    console.log('Valor recibido en query:', JSON.stringify(query));
+    if (DEBUG_MODE) console.log('Query:', JSON.stringify(query));
     const cleanQuery = query.trim().toLowerCase();
-    console.log('Valor limpio de query:', JSON.stringify(cleanQuery));
     const voiceChannel = interaction.member.voice.channel;
     const guildId = interaction.guildId;
 
@@ -405,6 +563,7 @@ async function handlePlay(interaction) {
     }
 
     const queue = queues.get(guildId);
+    queue.lastActivityTime = Date.now(); // Registrar actividad
 
     // Conectar al canal de voz si no está conectado
     if (!connections.has(guildId)) {
@@ -691,6 +850,7 @@ async function handleStop(interaction) {
         return interaction.reply({ content: '❌ No hay música reproduciéndose.', ephemeral: true });
     }
 
+    queue.clearCrossfade(); // Limpiar crossfade
     queue.clear();
     queue.isPlaying = false;
     if (queue.player) {
@@ -776,11 +936,16 @@ async function handleClear(interaction) {
 async function handleLeave(interaction) {
     const guildId = interaction.guildId;
     const connection = connections.get(guildId);
+    const queue = queues.get(guildId);
 
     if (!connection) {
         return interaction.reply({ content: '❌ No estoy conectado a ningún canal de voz.', ephemeral: true });
     }
 
+    if (queue) {
+        queue.clearCrossfade(); // Limpiar crossfade
+    }
+    
     connection.destroy();
     connections.delete(guildId);
     queues.delete(guildId);
@@ -798,16 +963,18 @@ async function handleHelp(interaction) {
             { name: '/play <canción o enlace>', value: '🎵 Reproduce música de YouTube o Spotify.' },
             { name: '/skip', value: '⏭️ Salta la canción actual.' },
             { name: '/queue o /cola', value: '📋 Muestra la cola de reproducción.' },
+            { name: '/shuffle', value: '🔀 Mezcla aleatoriamente la cola de canciones.' },
             { name: '/stop', value: '⏹️ Detiene la reproducción y limpia la cola.' },
             { name: '/pause', value: '⏸️ Pausa la reproducción.' },
             { name: '/resume', value: '▶️ Reanuda la reproducción.' },
             { name: '/nowplaying', value: '🎶 Muestra la canción actual.' },
             { name: '/clear', value: '🧹 Limpia la cola de reproducción.' },
+            { name: '/remove <posición>', value: '🗑️ Elimina una canción específica de la cola.' },
             { name: '/leave', value: '🚪 Desconecta el bot del canal de voz.' },
             { name: '/musicconfig <canal_id>', value: '⚙️ Configura el canal de texto para el panel de música.' },
             { name: '/radio', value: '📻 Reproduce una estación de radio en vivo.' },
         )
-        .setFooter({ text: '¡Disfruta de la música!' });
+        .setFooter({ text: '¡Disfruta de la música! 💪' });
     await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
@@ -838,6 +1005,31 @@ async function handleRemove(interaction) {
         .setDescription(`**${removed.title}** — *${removed.artist}* fue eliminada de la cola.`);
     await interaction.reply({ embeds: [embed], ephemeral: true });
     await updateMusicPanel(queue.currentSong, queue, client);
+}
+
+// Función para manejar el comando shuffle
+async function handleShuffle(interaction) {
+    const guildId = interaction.guildId;
+    const queue = queues.get(guildId);
+
+    if (!queue || queue.isEmpty()) {
+        const embed = new EmbedBuilder()
+            .setColor('#ff0000')
+            .setTitle('❌ Cola vacía')
+            .setDescription('No hay canciones en la cola para mezclar.');
+        return interaction.reply({ embeds: [embed], ephemeral: true });
+    }
+
+    const countBefore = queue.songs.length;
+    queue.shuffle();
+    
+    const embed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('🔀 Cola mezclada')
+        .setDescription(`Se mezclaron **${countBefore}** canciones aleatoriamente.`)
+        .setFooter({ text: 'Usa /queue para ver el nuevo orden' });
+    
+    await interaction.reply({ embeds: [embed], ephemeral: true });
 }
 
 // Manejar errores

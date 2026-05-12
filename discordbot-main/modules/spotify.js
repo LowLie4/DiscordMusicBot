@@ -5,6 +5,25 @@ const { searchYouTube } = require('./youtube');
 // Configurar Spotify API
 let spotifyApi;
 
+// Cache para tracks de Spotify
+const spotifyCache = new Map();
+const SPOTIFY_CACHE_TTL = 3600000; // 1 hora
+
+function setSpotifyCache(key, value) {
+    spotifyCache.set(key, { value, timestamp: Date.now() });
+}
+
+function getSpotifyCache(key) {
+    const cached = spotifyCache.get(key);
+    if (cached && Date.now() - cached.timestamp < SPOTIFY_CACHE_TTL) {
+        return cached.value;
+    }
+    if (cached) {
+        spotifyCache.delete(key);
+    }
+    return null;
+}
+
 function initializeSpotify(clientId, clientSecret) {
     spotifyApi = new SpotifyWebApi({
         clientId: clientId,
@@ -17,28 +36,44 @@ async function authenticateSpotify() {
     try {
         const data = await spotifyApi.clientCredentialsGrant();
         spotifyApi.setAccessToken(data.body['access_token']);
-        console.log('Spotify autenticado correctamente');
+        console.log('✅ Spotify autenticado correctamente');
         
         // Renovar token cada 50 minutos
         setTimeout(authenticateSpotify, 50 * 60 * 1000);
     } catch (error) {
-        console.error('Error al autenticar Spotify:', error);
+        console.error('❌ Error al autenticar Spotify:', error.message);
     }
 }
 
-// Función para obtener información de Spotify
+// Función para obtener información de Spotify CON CACHÉ
 async function getSpotifyTrackInfo(trackId) {
     try {
-        const track = await spotifyApi.getTrack(trackId);
-        console.log('Respuesta de Spotify API:', track.body);
-        return {
+        // Verificar caché
+        const cached = getSpotifyCache(trackId);
+        if (cached) {
+            return cached;
+        }
+
+        // Timeout para API de Spotify (10 segundos)
+        const trackPromise = spotifyApi.getTrack(trackId);
+        const timeoutPromise = new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('API de Spotify excedió el tiempo límite')), 10000)
+        );
+
+        const track = await Promise.race([trackPromise, timeoutPromise]);
+        
+        const result = {
             name: track.body.name,
             artist: track.body.artists.map(artist => artist.name).join(', '),
             duration: track.body.duration_ms,
             external_urls: track.body.external_urls.spotify
         };
+        
+        // Cachear resultado
+        setSpotifyCache(trackId, result);
+        return result;
     } catch (error) {
-        console.error('Error al obtener información de Spotify:', error);
+        console.error('❌ Error al obtener información de Spotify:', error.message);
         return null;
     }
 }
@@ -46,7 +81,6 @@ async function getSpotifyTrackInfo(trackId) {
 // Función para procesar track de Spotify
 async function processSpotifyTrack(trackId, interaction) {
     const spotifyTrack = await getSpotifyTrackInfo(trackId);
-    console.log('Info de la pista de Spotify:', spotifyTrack);
     
     if (!spotifyTrack) {
         return null;
@@ -55,7 +89,6 @@ async function processSpotifyTrack(trackId, interaction) {
     // 1. Buscar con el string original
     let searchQuery = `${spotifyTrack.artist} ${spotifyTrack.name}`;
     let youtubeVideo = await searchYouTube(searchQuery);
-    console.log('Intento 1 (original):', searchQuery, youtubeVideo);
 
     // 2. Limpiar nombre y artista si no encuentra nada
     if (!youtubeVideo) {
@@ -65,13 +98,11 @@ async function processSpotifyTrack(trackId, interaction) {
         // 2.1 Artista + nombre limpio
         searchQuery = `${cleanArtist} ${cleanName}`;
         youtubeVideo = await searchYouTube(searchQuery);
-        console.log('Intento 2 (limpio):', searchQuery, youtubeVideo);
 
         // 2.2 Solo nombre limpio
         if (!youtubeVideo) {
             searchQuery = cleanName;
             youtubeVideo = await searchYouTube(searchQuery);
-            console.log('Intento 3 (solo nombre limpio):', searchQuery, youtubeVideo);
         }
     }
 

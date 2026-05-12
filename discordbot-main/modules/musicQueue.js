@@ -6,7 +6,16 @@ class MusicQueue {
         this.isPlaying = false;
         this.player = null;
         this.connection = null;
-        this._hasAnnouncedNowPlaying = false; // Flag para controlar la primera reproducción
+        this._hasAnnouncedNowPlaying = false;
+        
+        // Crossfade support
+        this.crossfadeTimeout = null;
+        this.crossfadeInterval = null;
+        this.isCrossfading = false;
+        this.nextPlayer = null;
+        this.nextResource = null;
+        this.currentDuration = 0;
+        this.currentStartTime = 0;
     }
 
     addSong(song) {
@@ -20,6 +29,29 @@ class MusicQueue {
     clear() {
         this.songs = [];
         this.currentSong = null;
+        this.clearCrossfade();
+    }
+
+    // Limpiar timers de crossfade
+    clearCrossfade() {
+        if (this.crossfadeTimeout) clearTimeout(this.crossfadeTimeout);
+        if (this.crossfadeInterval) clearInterval(this.crossfadeInterval);
+        if (this.nextPlayer) {
+            this.nextPlayer.stop();
+            this.nextPlayer = null;
+        }
+        this.isCrossfading = false;
+        this.crossfadeTimeout = null;
+        this.crossfadeInterval = null;
+        this.nextResource = null;
+    }
+
+    // Mezcla la cola aleatoriamente (Fisher-Yates)
+    shuffle() {
+        for (let i = this.songs.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [this.songs[i], this.songs[j]] = [this.songs[j], this.songs[i]];
+        }
     }
 
     isEmpty() {
