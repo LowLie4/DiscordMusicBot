@@ -394,11 +394,15 @@ client.once('ready', async () => {
     
     // Registrar comandos slash
     try {
+        console.log('Limpiando comandos antiguos...');
+        // Eliminar todos los comandos del servidor para evitar duplicados
+        await client.application.commands.set([], config.guildId);
+        
         console.log('Registrando comandos slash...');
         await client.application.commands.set(commands, config.guildId);
-        console.log('Comandos slash registrados correctamente en el servidor de pruebas');
+        console.log(`✅ ${commands.length} Comandos slash registrados correctamente`);
     } catch (error) {
-        console.error('Error al registrar comandos:', error);
+        console.error('❌ Error al registrar comandos:', error);
     }
     // Actualizar panel de música al iniciar
     await updateMusicPanel(null, null, client);
