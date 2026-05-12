@@ -383,6 +383,10 @@ const commands = [
     new SlashCommandBuilder()
         .setName('shuffle')
         .setDescription('Mezcla aleatoriamente el orden de las canciones en la cola'),
+    
+    new SlashCommandBuilder()
+        .setName('cleanmessages')
+        .setDescription('Limpia manualmente los mensajes del canal de música (solo admin)'),
 ];
 
 // Evento cuando el bot está listo
@@ -1044,9 +1048,22 @@ process.on('unhandledRejection', error => {
 });
 
 if (process.env.NODE_ENV !== 'gestion') {
+    console.log('🚀 Iniciando proceso de gestión...');
     const { fork } = require('child_process');
-    fork('gestion.js', [], {
+    const gestionProcess = fork('gestion.js', [], {
         env: { ...process.env, NODE_ENV: 'gestion' }
+    });
+
+    gestionProcess.on('message', (msg) => {
+        console.log('📨 Mensaje de gestión:', msg);
+    });
+
+    gestionProcess.on('error', (err) => {
+        console.error('❌ Error en proceso de gestión:', err);
+    });
+
+    gestionProcess.on('exit', (code) => {
+        console.log(`⚠️ Proceso de gestión terminó con código: ${code}`);
     });
 }
 
